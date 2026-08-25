@@ -568,7 +568,7 @@
       <details class="help" style="margin-top:10px">
         <summary>¿Cómo se calcula la huella económica?</summary>
         <p>Con el modelo de la hoja de metas de la unidad: por cada manguera verificada,
-          <code>huella día = P1(in³) × (precio galón ÷ 231) × 150 despachos</code>; al mes se
+          <code>huella día = P1(in³) × (precio galón ÷ 231) × despachos</code>, donde <code>despachos = clientes al día ÷ mangueras verificadas</code>; al mes se
           multiplica por 30 días y se reporta el total absoluto.
           Los clientes al mes = clientes al día × 30. Solo Diesel, Regular y Superior tienen
           precio en el formato; otros productos no suman huella.</p>
@@ -1162,7 +1162,7 @@ function saveCurrent(){
   saveRecs(recs); editingId=r.id;
   toast('Verificación guardada ✓',0,1);
   // El No. ML-VC es la llave con la que la DSNC identifica el reporte
-  if(cfg.dsncUrl && dsncPayload(r).verificaciones>0 && !dsncIdReporte(r)){
+  if(cfg.dsncUrl && !dsncIdReporte(r)){
     setTimeout(()=>toast('Falta el No. ML-VC: la meta se enviará a la DSNC al asignarlo',1),1600);
   }
   trySync(r);
@@ -1242,7 +1242,15 @@ async function postRecord(r){
    huella al mes     = × 30 días  (negativa y positiva por separado; total = |neg| + pos)
    clientes al mes   = clientes al día × 30
    La hoja usa P1 (condición como se encontró); si P1 está vacío se usa P2. */
-const DSNC_GAL_IN3=231, DSNC_DESPACHOS_DIA=150, DSNC_DIAS_MES=30;
+const DSNC_GAL_IN3=231, DSNC_DIAS_MES=30;
+/* Despachos por manguera (según la hoja de metas de la unidad):
+   los clientes atendidos al día se reparten entre las mangueras verificadas,
+   redondeado al entero más cercano. Antes se usaba un valor fijo de 150, lo que
+   sobreestimaba la huella económica. */
+function dsncDespachos(cliDia, verificaciones){
+  if(!cliDia || !verificaciones) return 0;
+  return Math.floor(cliDia/verificaciones + 0.5);
+}
 /* ---- Normalización para la DSNC ----
    Unifica nombres para que su sistema no cuente variantes como productos o
    lugares distintos ("Súper"/"Superior", "MIXCO"/"Mixco"). Solo afecta al JSON
@@ -1279,17 +1287,19 @@ function dsncPayload(r){
     if(p==='Superior')return num(r.precioS);
     return null;};                                   // otros productos: sin precio en el formato
   const rows=(r.rows||[]).filter(x=>String(x.prod||'').trim()||String(x.p1||'').trim()||String(x.p2||'').trim());
+  const cliDiaN=num(r.vehiculosDia)||0;
+  const despachos=dsncDespachos(cliDiaN, rows.length);   // clientes al día ÷ mangueras verificadas
   let negDia=0,posDia=0;
   rows.forEach(x=>{
     const e=(num(x.p1)!=null)?num(x.p1):num(x.p2);   // P1; respaldo P2
     const pg=precio(x.prod);
     if(e==null||pg==null) return;
-    const dia=e*(pg/DSNC_GAL_IN3)*DSNC_DESPACHOS_DIA;
+    const dia=e*(pg/DSNC_GAL_IN3)*despachos;
     if(dia<0) negDia+=dia; else posDia+=dia;
   });
   const inm=rows.reduce((n,x)=>{const v2=num(x.p2),v1=num(x.p1);const v=(v2!=null)?v2:v1;
     return n+(((v!=null&&v<-6)||x.res==='Rechazo')?1:0);},0);
-  const cliDia=num(r.vehiculosDia)||0;
+  const cliDia=cliDiaN;
   const round2=v=>Math.round(v*100)/100;
   const negMes=negDia*DSNC_DIAS_MES, posMes=posDia*DSNC_DIAS_MES;
   const prods=[...new Set(rows.map(x=>normProd(x.prod)).filter(Boolean))]
@@ -1356,10 +1366,10 @@ function dsncIdReporte(r){
 }
 // La DSNC solo acepta registros con actividad cuantificable
 function dsncTieneActividad(r){
-  const m=dsncPayload(r);
-  // Se envía cuando ya hay surtidores verificados Y existe el No. ML-VC, que es la
-  // llave con la que la DSNC actualiza el registro (sin él se duplicaría).
-  return m.verificaciones>0 && !!m.idReporte;
+  // Única condición para enviar: que exista el No. ML-VC, que es la llave con la
+  // que la DSNC identifica y actualiza el registro. Los demás campos pueden estar
+  // incompletos: cada nuevo guardado reenvía la meta con el mismo identificador.
+  return !!dsncIdReporte(r);
 }
 async function postDsncBatch(metas){
   const modo=cfg.dsncModo||'post';
@@ -1379,6 +1389,9 @@ async function postDsncBatch(metas){
   const res=await fetchTO(cfg.dsncUrl,{method:'POST',headers:{'Content-Type':'text/plain;charset=utf-8'},body,redirect:'follow'},90000);
   if(!res.ok) return false;
   const v=dsncRespuestaOk(await res.text());
+  // Registro aún sin actividad: la DSNC lo recibió y lo descartó. Reintentarlo no
+  // cambiaría nada, así que sale de la cola; se reenviará al guardar con datos.
+  if(v.vacio) return 'vacio';
   if(!v.ok) toast('La DSNC rechazó el envío: '+v.detalle,1);
   return v.ok;
 }
@@ -1391,8 +1404,8 @@ async function flushQueueDsnc(){
   const metas=ids.map(id=>dsncPayload(recs.find(x=>x.id===id)));
   try{
     const ok=await postDsncBatch(metas);
-    if(ok){
-      ids.forEach(id=>{const r=recs.find(x=>x.id===id); if(r) r.dsncSynced=true;});
+    if(ok===true || ok==='vacio'){
+      ids.forEach(id=>{const r=recs.find(x=>x.id===id); if(r) r.dsncSynced=(ok===true);});
       q=q.filter(id=>!ids.includes(id));
       saveRecs(recs); LS.set(KEY_QUEUE_DSNC,q);
     }
@@ -1486,6 +1499,7 @@ document.getElementById('testDsncUrl').addEventListener('click',async()=>{
     const ok=await postDsncBatch([dsncPayload({fecha:new Date().toISOString().slice(0,10),
       departamento:'Guatemala',municipio:'Guatemala',vehiculosDia:'0',rows:[]})]);
     if(cfg.dsncModo==='nocors') toast('Prueba enviada (sin verificación de respuesta)',0,1);
+    else if(ok==='vacio') toast('Conexión con la DSNC verificada ✓',0,1);
     else if(ok) toast('Prueba DSNC enviada ✓',0,1);
     else if(/actividad cuantificable/i.test(dsncUltimaResp)) toast('Conexión con la DSNC verificada ✓',0,1);
     else toast('El servidor DSNC respondió error (revise el Diagnóstico)',1);
