@@ -1161,6 +1161,10 @@ function saveCurrent(){
   if(i>=0) recs[i]=r; else recs.unshift(r);
   saveRecs(recs); editingId=r.id;
   toast('Verificación guardada ✓',0,1);
+  // El No. ML-VC es la llave con la que la DSNC identifica el reporte
+  if(cfg.dsncUrl && dsncPayload(r).verificaciones>0 && !dsncIdReporte(r)){
+    setTimeout(()=>toast('Falta el No. ML-VC: la meta se enviará a la DSNC al asignarlo',1),1600);
+  }
   trySync(r);
   renderRecCount();
 }
@@ -1293,6 +1297,11 @@ function dsncPayload(r){
       return (ia<0?99:ia)-(ib<0?99:ib) || a.localeCompare(b);});   // Superior, Regular, Diesel…
   return {
     tipo:'meta_dsnc',
+    // Identificador único del reporte: el No. ML-VC oficial (ej. ML-VC-001-26).
+    // Es el mismo aunque se edite y se vuelva a guardar, para que la DSNC
+    // actualice el registro en vez de duplicarlo.
+    idReporte:dsncIdReporte(r),
+    actualizado:r.savedAt||'',         // marca de la última edición (para saber cuál manda)
     unidad:'Unidad de verificación de dispensadores de combustibles',
     fecha:r.fecha||'',                 // para que la DSNC agrupe por mes
     departamento:normLugar(r.departamento),
@@ -1339,10 +1348,18 @@ function dsncRespuestaOk(texto){
   if(rec>0 && ins===0 && dup===0) return {ok:false, detalle:'no se insertó ningún registro', j};
   return {ok:true, detalle:`insertados: ${ins}, duplicados: ${dup}`, j};
 }
+// Identificador oficial del reporte: ML-VC-<correlativo> (evita prefijo duplicado
+// si el inspector ya lo escribió completo en el campo).
+function dsncIdReporte(r){
+  const n=String(r.noML||'').trim().replace(/^ml[\s-]*vc[\s-]*/i,'').trim();
+  return n ? ('ML-VC-'+n) : '';
+}
 // La DSNC solo acepta registros con actividad cuantificable
 function dsncTieneActividad(r){
   const m=dsncPayload(r);
-  return m.verificaciones>0 || m.clientesMes>0 || m.huellaEconomicaMesQ>0;
+  // Se envía cuando ya hay surtidores verificados Y existe el No. ML-VC, que es la
+  // llave con la que la DSNC actualiza el registro (sin él se duplicaría).
+  return m.verificaciones>0 && !!m.idReporte;
 }
 async function postDsncBatch(metas){
   const modo=cfg.dsncModo||'post';
