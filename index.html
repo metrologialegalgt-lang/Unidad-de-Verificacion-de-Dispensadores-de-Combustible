@@ -1658,8 +1658,10 @@ document.getElementById('exportDsnc').addEventListener('click',()=>{
   const metas=getRecs().map(dsncPayload);
   if(!metas.length){toast('No hay verificaciones para exportar',1);return;}
   const name='metas_dsnc_'+new Date().toISOString().slice(0,10)+'.json';
-  saveTextFile(name, JSON.stringify(dsncEnvelope(metas),null,2), 'application/json');
-  toast('Metas DSNC exportadas ✓',0,1);
+  // El archivo se comparte por correo: se omite la API Key por seguridad
+  const sobre=dsncEnvelope(metas); delete sobre.apiKey;
+  saveTextFile(name, JSON.stringify(sobre,null,2), 'application/json');
+  toast('Metas DSNC exportadas ✓ (sin la API Key)',0,1);
 });
 document.getElementById('saveUrl').addEventListener('click',()=>{
   cfg.syncUrl=limpiaUrl(document.getElementById('syncUrl').value);
