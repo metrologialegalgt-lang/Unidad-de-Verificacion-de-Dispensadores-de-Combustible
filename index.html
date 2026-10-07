@@ -534,6 +534,33 @@
       </details>
     </div>
     <div class="setrow">
+      <h3>Base anual de verificaciones (Google Sheets)</h3>
+      <p>Cuando un reporte está <b>completo</b>, se escribe automáticamente en la base anual
+        (hojas <code>datos_admin</code> y <code>datos_metrologicos</code>). Si el No. ML-VC ya existe,
+        se <b>actualiza</b> en lugar de duplicarse. Al cambiar de año solo cambie el enlace de la hoja.</p>
+      <label class="f" style="color:var(--muted)">URL del Apps Script (termina en /exec)
+        <input id="sheetScriptUrl" placeholder="https://script.google.com/macros/s/…/exec" style="margin-top:5px"></label>
+      <label class="f" style="color:var(--muted);margin-top:8px">Enlace de la base del año en curso
+        <input id="sheetUrl" placeholder="https://docs.google.com/spreadsheets/d/…/edit" style="margin-top:5px"></label>
+      <div id="sheetIdInfo" style="font-size:12px;color:var(--muted);margin-top:4px"></div>
+      <label class="f" style="color:var(--muted);margin-top:8px">Token del script
+        <input id="sheetToken" placeholder="La clave definida en el script" style="margin-top:5px"></label>
+      <div class="btnline" style="margin-top:10px">
+        <button id="saveSheetCfg">Guardar</button>
+        <button class="sec" id="testSheet">Probar conexión</button>
+      </div>
+      <pre id="sheetOut" style="display:none;margin-top:10px;background:#0F172A;color:#E2E8F0;border-radius:10px;
+        padding:11px 12px;font-size:11.5px;line-height:1.5;white-space:pre-wrap;word-break:break-word"></pre>
+      <details class="help" style="margin-top:10px">
+        <summary>¿Cuándo se considera completo un reporte?</summary>
+        <p>No. ML-VC, fecha, nombre comercial, departamento, municipio, vehículos atendidos/día,
+          el precio de cada producto verificado (Diesel, Regular, Superior), al menos un ensayo y,
+          en cada ensayo: producto, C, S, P1, P2 cuando P1 &lt; −3, vuelta a cero y calculadora.
+          Además el nombre y firma del encargado y la firma del personal de la UIVML.
+          Si falta algo, el reporte se guarda en la app pero no se envía a la base.</p>
+      </details>
+    </div>
+    <div class="setrow">
       <h3>Metas DSNC (Dirección del Sistema Nacional de la Calidad)</h3>
       <p>Al guardar cada verificación se encola una <b>meta por estación</b> y se envía al endpoint
         de la DSNC en el formato que ellos indicaron:
@@ -617,7 +644,7 @@ const LS = {
   set:(k,v)=>{try{localStorage.setItem(k,JSON.stringify(v))}catch(e){toast('No se pudo guardar (almacenamiento lleno)',1)}},
 };
 const KEY_RECS='uivml_records', KEY_QUEUE='uivml_queue', KEY_CFG='uivml_cfg', KEY_QUEUE_DSNC='uivml_queue_dsnc';
-let cfg = LS.get(KEY_CFG,{syncUrl:'',device:'',dsncUrl:'',dsncKey:'',dsncModo:'post'});
+let cfg = LS.get(KEY_CFG,{syncUrl:'',device:'',dsncUrl:'',dsncKey:'',dsncModo:'post',sheetScriptUrl:'',sheetUrl:'',sheetId:'',sheetToken:''});
 let editingId = null;
 
 /* ====================================================================== */
@@ -1166,6 +1193,7 @@ function saveCurrent(){
     setTimeout(()=>toast('Falta el No. ML-VC: la meta se enviará a la DSNC al asignarlo',1),1600);
   }
   trySync(r);
+  trySheet(r);
   renderRecCount();
 }
 function renderRecCount(){
@@ -1195,8 +1223,13 @@ function renderRecList(){
   if(!recs.length){list.innerHTML='<div class="empty">No hay verificaciones guardadas todavía.<br>Complete el formulario y toque <b>Guardar</b>.</div>';return;}
   list.innerHTML='';
   recs.forEach(r=>{
-    const badge=r.synced?'<span class="badge synced">Sincronizado</span>'
+    let badge=r.synced?'<span class="badge synced">Sincronizado</span>'
       :(cfg.syncUrl?'<span class="badge pend">Pendiente</span>':'<span class="badge local">Local</span>');
+    if(cfg.sheetScriptUrl&&cfg.sheetId){
+      const falta=registroFaltantes(r).length;
+      badge+= r.sheetSynced&&!falta ? ' <span class="badge synced">En base anual</span>'
+        : (falta ? ' <span class="badge local">Incompleto</span>' : ' <span class="badge pend">Base: pendiente</span>');
+    }
     const d=document.createElement('div'); d.className='rec';
     d.innerHTML=`<div class="top"><div>
         <div class="nm">${esc(r.nombreComercial)||'(sin nombre)'}</div>
@@ -1221,11 +1254,154 @@ const esc=s=>(s==null?'':String(s)).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;
 /* ====================================================================== */
 /* Sync                                                                   */
 /* ====================================================================== */
+/* ====================================================================== */
+/* Base anual de verificaciones (Google Sheets vía Apps Script)            */
+/* ====================================================================== */
+const KEY_QUEUE_SHEET='uivml_queue_sheet';
+let sheetEnviando=false;
+function sheetIdFromUrl(u){
+  const s=String(u||'').trim();
+  const m=s.match(/\/spreadsheets\/d\/([a-zA-Z0-9_-]{20,})/) || s.match(/^([a-zA-Z0-9_-]{25,})$/);
+  return m?m[1]:'';
+}
+function mlvcCorto(r){ return String(r.noML||'').trim().replace(/^ml[\s-]*vc[\s-]*/i,'').trim(); }
+function _num(v){const x=parseFloat(String(v??'').replace(',','.'));return isNaN(x)?null:x;}
+function _filas(r){
+  return (r.rows||[]).filter(x=>String(x.prod||'').trim()||String(x.p1||'').trim()||String(x.p2||'').trim());
+}
+// Huella por ensayo con la misma fórmula de las metas DSNC
+function huellaDetalle(r){
+  const rows=_filas(r);
+  const cliDia=_num(r.vehiculosDia)||0;
+  const desp=dsncDespachos(cliDia, rows.length);
+  const pS=_num(r.precioS), pR=_num(r.precioR), pD=_num(r.precioD);
+  const pul={Superior:pS!=null?pS/231:null, Regular:pR!=null?pR/231:null, Diesel:pD!=null?pD/231:null};
+  let neg=0,pos=0;
+  const ensayos=rows.map((x,i)=>{
+    const prod=normProd(x.prod);
+    const p1=_num(x.p1), p2=_num(x.p2);
+    const e=(p1!=null)?p1:p2;
+    const pu=(prod in pul)?pul[prod]:null;
+    const hE=(e!=null&&pu!=null)?e*pu:0, hD=hE*desp;
+    if(hD<0) neg+=hD; else pos+=hD;
+    const sn=_num(x.s);
+    return {n:i+1, producto:String(prod||x.prod||'').toUpperCase(), c:x.c||'', s:sn!=null?sn:(x.s||''),
+      p1:p1!=null?p1:'', p2:p2!=null?p2:'',
+      vueltaCero:x.vc==='yes'?'Si':x.vc==='no'?'No':'', calculadora:x.cal==='yes'?'Si':x.cal==='no'?'No':'',
+      hEnsayo:hE, hDia:hD};
+  });
+  return {desp, cliDia, pul, ensayos, neg:neg*DSNC_DIAS_MES, pos:pos*DSNC_DIAS_MES, total:(Math.abs(neg)+pos)*DSNC_DIAS_MES};
+}
+// Lista de lo que falta para considerar el reporte completo
+function registroFaltantes(r){
+  const f=[], v=k=>String(r[k]??'').trim();
+  if(!mlvcCorto(r)) f.push('No. ML-VC');
+  if(!v('fecha')) f.push('fecha');
+  if(!v('nombreComercial')) f.push('nombre comercial');
+  if(!v('departamento')) f.push('departamento');
+  if(!v('municipio')) f.push('municipio');
+  if(_num(r.vehiculosDia)==null) f.push('vehículos atendidos/día');
+  const rows=_filas(r);
+  if(!rows.length) f.push('verificaciones');
+  const usados=new Set(rows.map(x=>normProd(x.prod)));
+  if(usados.has('Diesel')  && _num(r.precioD)==null) f.push('precio Diesel');
+  if(usados.has('Regular') && _num(r.precioR)==null) f.push('precio Regular');
+  if(usados.has('Superior')&& _num(r.precioS)==null) f.push('precio Superior');
+  rows.forEach((x,i)=>{
+    const fx=[], p1=_num(x.p1);
+    if(!String(x.prod||'').trim()) fx.push('producto');
+    if(!String(x.c||'').trim()) fx.push('C');
+    if(!String(x.s||'').trim()) fx.push('S');
+    if(p1==null) fx.push('P1');
+    if(p1!=null && p1<-3 && _num(x.p2)==null) fx.push('P2');
+    if(!x.vc) fx.push('vuelta a cero');
+    if(!x.cal) fx.push('calculadora');
+    if(fx.length) f.push(`ensayo ${i+1} (${fx.join(', ')})`);
+  });
+  if(!v('nombreEncargado')) f.push('nombre del encargado');
+  if(!r.sigEncargado) f.push('firma del encargado');
+  if(!r.sigUIVML) f.push('firma del personal UIVML');
+  return f;
+}
+// "Ajuste por:" con el catálogo de la base anual
+function ajustePor(r, h){
+  const fuera=h.ensayos.some(e=>e.p2!==''&&e.p2<-3);
+  let viejo=false;
+  if(r.fechaAjuste && r.fecha){
+    const ref=new Date(r.fecha+'T00:00:00'); ref.setMonth(ref.getMonth()-3);
+    viejo=new Date(r.fechaAjuste+'T00:00:00')<ref;
+  }
+  return fuera&&viejo?'AJUSTE POR AMBOS 1 Y 2':fuera?'1.ENSAYOS FUERA DE RANGO':viejo?'2.NO AJUSTE DURANTE 3 MESES':'';
+}
+function sheetPayload(r){
+  const h=huellaDetalle(r), cli=h.cliDia, t=String(r.tel||'').replace(/\D/g,'');
+  const n=k=>{const x=_num(r[k]);return x!=null?x:'';};
+  return {action:'UVC_UPSERT', token:cfg.sheetToken||'', spreadsheetId:cfg.sheetId,
+    registro:{
+      mlvc:mlvcCorto(r), fecha:r.fecha||'', nombre:String(r.nombreComercial||'').trim(),
+      emblema:r.emblema||'', direccion:r.direccion||'', departamento:String(r.departamento||'').trim(),
+      municipio:String(r.municipio||'').trim(), telefono:t?Number(t):(r.tel||''),
+      clientesDia:cli, clientesMes:cli*DSNC_DIAS_MES, marca:r.marca||'', modelo:r.modelo||'',
+      totalSurtidores:n('totalSurtidores'), verificaciones:h.ensayos.length,
+      ultimaEmpresa:r.ultimaEmpresa||'', fechaAjuste:r.fechaAjuste||'',
+      mojS:n('mojS'), mojR:n('mojR'), mojD:n('mojD'),
+      precioS:n('precioS'), precioR:n('precioR'), precioD:n('precioD'),
+      requiereAjuste:r.enviarReporte==='Sí'?'SI':r.enviarReporte==='No'?'NO':'',
+      ajustePor:ajustePor(r,h), inmovilizaciones:dsncPayload(r).inmovilizaciones,
+      observaciones:r.observaciones||'',
+      pulgS:h.pul.Superior??'', pulgR:h.pul.Regular??'', pulgD:h.pul.Diesel??'',
+      despachos:h.desp, huellaNeg:h.neg, huellaPos:h.pos, huellaTotal:h.total
+    },
+    ensayos:h.ensayos};
+}
+async function postSheet(body){
+  const res=await fetchTO(cfg.sheetScriptUrl,{method:'POST',headers:{'Content-Type':'text/plain;charset=utf-8'},
+    body:JSON.stringify(body),redirect:'follow'},90000);
+  let j={}; try{ j=JSON.parse(await res.text()); }catch(e){ j={success:false,message:'Respuesta no reconocida'}; }
+  if(!res.ok) j.success=false;
+  return j;
+}
+async function flushQueueSheet(){
+  if(sheetEnviando||!cfg.sheetScriptUrl||!cfg.sheetId||!navigator.onLine) return;
+  let q=LS.get(KEY_QUEUE_SHEET,[]); if(!q.length){setSyncPill();return;}
+  sheetEnviando=true; const hechos={};
+  try{
+    for(const id of [...q]){
+      const r=getRecs().find(x=>x.id===id);
+      if(!r||registroFaltantes(r).length){ q=q.filter(x=>x!==id); continue; }
+      try{
+        const j=await postSheet(sheetPayload(r));
+        if(j.success){ hechos[id]=j; q=q.filter(x=>x!==id); }
+        else { toast('Base anual: '+(j.message||'error al escribir'),1); break; }
+      }catch(e){ break; }               // sin conexión: se reintenta después
+    }
+  } finally {
+    LS.set(KEY_QUEUE_SHEET,q);
+    const recs=getRecs();                // releer: pudo guardarse otro registro mientras tanto
+    Object.entries(hechos).forEach(([id,j])=>{const x=recs.find(y=>y.id===id);
+      if(x){x.sheetSynced=true;x.sheetSyncedAt=new Date().toISOString();x.sheetAccion=j.accion;}});
+    if(Object.keys(hechos).length){ saveRecs(recs);
+      const k=Object.values(hechos); const ult=k[k.length-1];
+      toast(`Base anual ${ult.accion==='actualizado'?'actualizada':'actualizada (registro nuevo)'} ✓`,0,1); }
+    sheetEnviando=false; setSyncPill(); renderRecList?.();
+  }
+}
+function trySheet(r){
+  if(!cfg.sheetScriptUrl||!cfg.sheetId) return;
+  const falta=registroFaltantes(r);
+  if(falta.length){
+    setTimeout(()=>toast('Incompleto, no se envía a la base: falta '+falta.slice(0,3).join(', ')
+      +(falta.length>3?` y ${falta.length-3} más`:''),1),3200);
+    return;
+  }
+  let q=LS.get(KEY_QUEUE_SHEET,[]); q.push(r.id); LS.set(KEY_QUEUE_SHEET,[...new Set(q)]);
+  setSyncPill(); flushQueueSheet();
+}
 function setSyncPill(){
   const p=document.getElementById('syncPill'), t=document.getElementById('syncTxt');
-  const q=LS.get(KEY_QUEUE,[]).length + LS.get(KEY_QUEUE_DSNC,[]).length;
+  const q=LS.get(KEY_QUEUE,[]).length + LS.get(KEY_QUEUE_DSNC,[]).length + LS.get(KEY_QUEUE_SHEET,[]).length;
   p.className='pill';
-  if(!cfg.syncUrl && !cfg.dsncUrl){t.textContent='Local';return;}
+  if(!cfg.syncUrl && !cfg.dsncUrl && !cfg.sheetScriptUrl){t.textContent='Local';return;}
   if(!navigator.onLine){p.classList.add('off');t.textContent='Sin conexión'+(q?` · ${q}`:'');return;}
   if(q){p.classList.add('sync');t.textContent=`Pendientes: ${q}`;}
   else{p.classList.add('on');t.textContent='En línea';}
@@ -1433,7 +1609,7 @@ async function flushQueue(){
   }
   saveRecs(recs); LS.set(KEY_QUEUE,q); setSyncPill(); renderRecList?.();
 }
-window.addEventListener('online',()=>{setSyncPill();flushQueue();flushQueueDsnc();});
+window.addEventListener('online',()=>{setSyncPill();flushQueue();flushQueueDsnc();flushQueueSheet();});
 window.addEventListener('offline',setSyncPill);
 
 /* ====================================================================== */
@@ -1442,6 +1618,51 @@ window.addEventListener('offline',setSyncPill);
 document.getElementById('syncUrl').value=cfg.syncUrl||'';
 document.getElementById('dsncUrl').value=cfg.dsncUrl||'';
 document.getElementById('dsncKey').value=cfg.dsncKey||'';
+/* ---- Base anual (Google Sheets) ---- */
+document.getElementById('sheetScriptUrl').value=cfg.sheetScriptUrl||'';
+document.getElementById('sheetUrl').value=cfg.sheetUrl||'';
+document.getElementById('sheetToken').value=cfg.sheetToken||'';
+function sheetMuestraId(){
+  const u=document.getElementById('sheetUrl').value, id=sheetIdFromUrl(u), el=document.getElementById('sheetIdInfo');
+  el.innerHTML = !u.trim() ? '' : id ? '✓ Hoja identificada: <code>'+esc(id.slice(0,10))+'…'+esc(id.slice(-6))+'</code>'
+    : '<span style="color:var(--bad)">⚠ No parece un enlace de Google Sheets (debe contener /spreadsheets/d/…)</span>';
+}
+document.getElementById('sheetUrl').addEventListener('input',sheetMuestraId); sheetMuestraId();
+function sheetLeeCfg(){
+  cfg.sheetScriptUrl=limpiaUrl(document.getElementById('sheetScriptUrl').value);
+  cfg.sheetUrl=limpiaUrl(document.getElementById('sheetUrl').value);
+  cfg.sheetId=sheetIdFromUrl(cfg.sheetUrl);
+  cfg.sheetToken=document.getElementById('sheetToken').value.trim();
+  document.getElementById('sheetScriptUrl').value=cfg.sheetScriptUrl;
+  document.getElementById('sheetUrl').value=cfg.sheetUrl;
+  LS.set(KEY_CFG,cfg); sheetMuestraId();
+}
+document.getElementById('saveSheetCfg').addEventListener('click',()=>{
+  sheetLeeCfg();
+  if(cfg.sheetUrl && !cfg.sheetId){toast('Revise el enlace de la hoja',1);return;}
+  toast('Base anual configurada',0,1); setSyncPill(); renderRecList?.();
+});
+document.getElementById('testSheet').addEventListener('click',async()=>{
+  sheetLeeCfg();
+  const out=document.getElementById('sheetOut');
+  if(!cfg.sheetScriptUrl||!cfg.sheetId){toast('Ingrese la URL del script y el enlace de la hoja',1);return;}
+  out.style.display='block'; out.textContent='Conectando con la base anual…';
+  try{
+    const j=await postSheet({action:'UVC_PING', token:cfg.sheetToken||'', spreadsheetId:cfg.sheetId});
+    if(j.success){
+      const L=['✓ CONEXIÓN CORRECTA','Archivo: '+j.archivo,
+        'Registros en datos_admin: '+j.registros,'Ensayos en datos_metrologicos: '+j.ensayos];
+      if(j.columnasNoEncontradas&&j.columnasNoEncontradas.length)
+        L.push('','⚠ Columnas no encontradas (no se llenarán):',' · '+j.columnasNoEncontradas.join('\n · '));
+      else L.push('Todas las columnas fueron identificadas.');
+      out.textContent=L.join('\n');
+      flushQueueSheet();
+    } else out.textContent='✗ '+(j.message||'El script respondió con error');
+  }catch(e){
+    out.textContent='✗ No se pudo conectar: '+(e.name==='AbortError'?'tiempo de espera agotado':e.message)
+      +'\nRevise que la URL termine en /exec y que el script esté publicado para "Cualquier usuario".';
+  }
+});
 document.getElementById('dsncModo').value=cfg.dsncModo||'post';
 document.getElementById('deviceName').value=cfg.device||'';
 // Revisa que la URL sea la de implementación (/exec) y no la temporal de contenido
@@ -1681,7 +1902,7 @@ document.getElementById('testUrl').addEventListener('click',async()=>{
   catch(e){toast('No se pudo conectar al servidor',1);}
   setSyncPill();
 });
-document.getElementById('flushNow').addEventListener('click',()=>{flushQueue();flushQueueDsnc();toast('Sincronizando…');});
+document.getElementById('flushNow').addEventListener('click',()=>{flushQueue();flushQueueDsnc();flushQueueSheet();toast('Sincronizando…');});
 document.getElementById('exportJson').addEventListener('click',()=>{
   const name='verificaciones_uivml_'+new Date().toISOString().slice(0,10)+'.json';
   saveTextFile(name, JSON.stringify(getRecs(),null,2), 'application/json');
