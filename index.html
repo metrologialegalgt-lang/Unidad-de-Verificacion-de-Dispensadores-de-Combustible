@@ -1121,6 +1121,43 @@ function croquisPrintHTML(data){
 /* ====================================================================== */
 /* Signature pads                                                         */
 /* ====================================================================== */
+/* Firmas compactas: a resolución de pantalla (DPR 2-3) cada firma pesaba ~25 KB y
+   llenaba el almacenamiento del navegador (~5 MB, unos 98 registros). Se guardan a
+   480 px de ancho (más de 300 dpi al tamaño impreso) y con trazo sólido (sin bordes
+   semitransparentes, que el PNG comprime mal): ~6 KB por firma, 4 veces menos. */
+const FIRMA_MAX_W=480, FIRMA_UMBRAL=90;
+function firmaCompacta(src){
+  const k=Math.min(1, FIRMA_MAX_W/src.width);
+  const t=document.createElement('canvas');
+  t.width=Math.max(1,Math.round(src.width*k)); t.height=Math.max(1,Math.round(src.height*k));
+  const x=t.getContext('2d'); x.imageSmoothingQuality='high'; x.drawImage(src,0,0,t.width,t.height);
+  const im=x.getImageData(0,0,t.width,t.height), d=im.data;
+  for(let i=3;i<d.length;i+=4) d[i]=d[i]>FIRMA_UMBRAL?255:0;   // conserva el color de la tinta
+  x.putImageData(im,0,0);
+  return t.toDataURL('image/png');
+}
+function compactarDataUrl(d){
+  return new Promise(res=>{ const i=new Image();
+    i.onload=()=>{ try{ const n=firmaCompacta(i); res(n.length<d.length?n:d); }catch(e){ res(d); } };
+    i.onerror=()=>res(d); i.src=d; });
+}
+// Compacta una sola vez las firmas pesadas de registros ya guardados.
+// Solo reemplaza la firma si no cambió mientras se procesaba (sin copias viejas).
+async function compactarFirmasGuardadas(){
+  const cambios=[];
+  for(const r of getRecs()){
+    for(const k of ['sigEncargado','sigUIVML']){
+      const d=r[k]; if(!d || d.length<9000) continue;
+      const n=await compactarDataUrl(d);
+      if(n!==d) cambios.push({id:r.id,k,antes:d,nuevo:n});
+    }
+  }
+  if(!cambios.length) return 0;
+  const recs=getRecs();
+  cambios.forEach(c=>{const r=recs.find(x=>x.id===c.id); if(r && r[c.k]===c.antes) r[c.k]=c.nuevo;});
+  saveRecs(recs);
+  return cambios.length;
+}
 const sigs={};
 document.querySelectorAll('.sig[data-sig]').forEach(box=>{
   const name=box.dataset.sig; const c=box.querySelector('canvas'); const cx=c.getContext('2d');
@@ -1137,7 +1174,7 @@ document.querySelectorAll('.sig[data-sig]').forEach(box=>{
   box.querySelector('.clr').addEventListener('click',()=>cx.clearRect(0,0,c.width,c.height));
   sigs[name]={c,cx,size,
     data:()=>{const blank=document.createElement('canvas');blank.width=c.width;blank.height=c.height;
-      return c.toDataURL()===blank.toDataURL()?'':c.toDataURL('image/png');},
+      return c.toDataURL()===blank.toDataURL()?'':firmaCompacta(c);},
     load:(d)=>{cx.clearRect(0,0,c.width,c.height);if(d){const i=new Image();i.onload=()=>{const dpr=Math.min(window.devicePixelRatio||1,2);cx.drawImage(i,0,0,c.width/dpr,c.height/dpr);};i.src=d;}}
   };
 });
@@ -1259,7 +1296,6 @@ const esc=s=>(s==null?'':String(s)).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;
 /* Base anual de verificaciones (Google Sheets vía Apps Script)            */
 /* ====================================================================== */
 const KEY_QUEUE_SHEET='uivml_queue_sheet';
-let sheetEnviando=false;
 function sheetIdFromUrl(u){
   const s=String(u||'').trim();
   const m=s.match(/\/spreadsheets\/d\/([a-zA-Z0-9_-]{20,})/) || s.match(/^([a-zA-Z0-9_-]{25,})$/);
@@ -1362,30 +1398,26 @@ async function postSheet(body){
   if(!res.ok) j.success=false;
   return j;
 }
-async function flushQueueSheet(){
-  if(sheetEnviando||!cfg.sheetScriptUrl||!cfg.sheetId||!navigator.onLine) return;
-  let q=LS.get(KEY_QUEUE_SHEET,[]); if(!q.length){setSyncPill();return;}
-  sheetEnviando=true; const hechos={};
-  try{
-    for(const id of [...q]){
-      const r=getRecs().find(x=>x.id===id);
-      if(!r||registroFaltantes(r).length){ q=q.filter(x=>x!==id); continue; }
-      try{
-        const j=await postSheet(sheetPayload(r));
-        if(j.success){ hechos[id]=j; q=q.filter(x=>x!==id); }
-        else { toast('Base anual: '+(j.message||'error al escribir'),1); break; }
-      }catch(e){ break; }               // sin conexión: se reintenta después
-    }
-  } finally {
-    LS.set(KEY_QUEUE_SHEET,q);
-    const recs=getRecs();                // releer: pudo guardarse otro registro mientras tanto
-    Object.entries(hechos).forEach(([id,j])=>{const x=recs.find(y=>y.id===id);
-      if(x){x.sheetSynced=true;x.sheetSyncedAt=new Date().toISOString();x.sheetAccion=j.accion;}});
-    if(Object.keys(hechos).length){ saveRecs(recs);
-      const k=Object.values(hechos); const ult=k[k.length-1];
-      toast(`Base anual ${ult.accion==='actualizado'?'actualizada':'actualizada (registro nuevo)'} ✓`,0,1); }
-    sheetEnviando=false; setSyncPill(); renderRecList?.();
+async function flushQueueSheet(){ return correrSerie(flushQueueSheet, _flushSheet); }
+async function _flushSheet(){
+  if(!cfg.sheetScriptUrl||!cfg.sheetId||!navigator.onLine) return;
+  const q=LS.get(KEY_QUEUE_SHEET,[]); if(!q.length){setSyncPill();return;}
+  const fuera=new Set(q.filter(id=>{const r=getRecs().find(x=>x.id===id); return !r||registroFaltantes(r).length;}));
+  if(fuera.size) LS.set(KEY_QUEUE_SHEET, LS.get(KEY_QUEUE_SHEET,[]).filter(id=>!fuera.has(id)));
+  const enviados={}, accion={};
+  for(const id of q){
+    if(fuera.has(id)) continue;
+    const r=getRecs().find(x=>x.id===id); if(!r) continue;
+    try{
+      const j=await postSheet(sheetPayload(r));
+      if(j.success){ enviados[id]=r.savedAt; accion[id]=j.accion; }
+      else { toast('Base anual: '+(j.message||'error al escribir'),1); break; }
+    }catch(e){ break; }                  // sin conexión: se reintenta después
   }
+  const hechos=colaQuitar(KEY_QUEUE_SHEET, enviados);
+  marcar(hechos, r=>{ r.sheetSynced=true; r.sheetSyncedAt=new Date().toISOString(); r.sheetAccion=accion[r.id]; });
+  if(hechos.size) toast('Base anual actualizada ✓',0,1);
+  setSyncPill(); renderRecList?.();
 }
 function trySheet(r){
   if(!cfg.sheetScriptUrl||!cfg.sheetId) return;
@@ -1572,19 +1604,20 @@ async function postDsncBatch(metas){
   if(!v.ok) toast('La DSNC rechazó el envío: '+v.detalle,1);
   return v.ok;
 }
-async function flushQueueDsnc(){
+async function flushQueueDsnc(){ return correrSerie(flushQueueDsnc, _flushDsnc); }
+async function _flushDsnc(){
   if(!cfg.dsncUrl||!navigator.onLine) return;
-  let q=LS.get(KEY_QUEUE_DSNC,[]); if(!q.length){setSyncPill();return;}
-  const recs=getRecs();
-  const ids=q.filter(id=>{const r=recs.find(x=>x.id===id); return r && dsncTieneActividad(r);});  // descarta borrados y sin actividad
-  if(!ids.length){LS.set(KEY_QUEUE_DSNC,[]);setSyncPill();return;}
-  const metas=ids.map(id=>dsncPayload(recs.find(x=>x.id===id)));
+  const q=LS.get(KEY_QUEUE_DSNC,[]); if(!q.length){setSyncPill();return;}
+  const recs=getRecs(), lote=[], fuera=new Set();
+  q.forEach(id=>{const r=recs.find(x=>x.id===id);
+    if(r && dsncTieneActividad(r)) lote.push(r); else fuera.add(id);});   // borrados o sin actividad
+  if(fuera.size) LS.set(KEY_QUEUE_DSNC, LS.get(KEY_QUEUE_DSNC,[]).filter(id=>!fuera.has(id)));
+  if(!lote.length){setSyncPill();return;}
   try{
-    const ok=await postDsncBatch(metas);
+    const ok=await postDsncBatch(lote.map(dsncPayload));
     if(ok===true || ok==='vacio'){
-      ids.forEach(id=>{const r=recs.find(x=>x.id===id); if(r) r.dsncSynced=(ok===true);});
-      q=q.filter(id=>!ids.includes(id));
-      saveRecs(recs); LS.set(KEY_QUEUE_DSNC,q);
+      const env={}; lote.forEach(r=>env[r.id]=r.savedAt);
+      marcar(colaQuitar(KEY_QUEUE_DSNC, env), r=>{ r.dsncSynced=(ok===true); });
     }
   }catch(e){/* sin conexión: se conserva la cola y se reintenta */}
   setSyncPill(); renderRecList?.();
@@ -1598,17 +1631,46 @@ async function trySync(r){
   if(!navigator.onLine) return;
   await flushQueue(); await flushQueueDsnc();
 }
-async function flushQueue(){
+/* ---- Envíos seguros ----------------------------------------------------
+   Reglas para no perder datos cuando hay varios envíos en curso:
+   1) Nunca se vuelve a guardar una copia vieja de los registros: al terminar
+      se releen y solo se actualizan las marcas de envío.
+   2) De la cola solo se quita lo enviado en su versión vigente (savedAt); si
+      el reporte se volvió a guardar mientras viajaba, queda pendiente.
+   3) No corren dos envíos del mismo tipo a la vez; si se pide otro durante
+      el envío, se repite al terminar. */
+async function correrSerie(f, cuerpo){
+  if(f._run){ f._again=true; return; }
+  f._run=true;
+  try{ do{ f._again=false; await cuerpo(); }while(f._again); }
+  finally{ f._run=false; }
+}
+function colaQuitar(key, enviados){            // enviados: {id: savedAt enviado}
+  const recs=getRecs(), hechos=new Set();
+  Object.keys(enviados).forEach(id=>{const r=recs.find(x=>x.id===id);
+    if(!r || r.savedAt===enviados[id]) hechos.add(id);});
+  LS.set(key, LS.get(key,[]).filter(id=>!hechos.has(id)));
+  return hechos;
+}
+function marcar(ids, fn){
+  if(!ids.size) return;
+  const recs=getRecs(); let cambio=false;
+  recs.forEach(r=>{ if(ids.has(r.id)){ fn(r); cambio=true; } });
+  if(cambio) saveRecs(recs);
+}
+async function flushQueue(){ return correrSerie(flushQueue, _flushCename); }
+async function _flushCename(){
   if(!cfg.syncUrl||!navigator.onLine) return;
-  let q=LS.get(KEY_QUEUE,[]); if(!q.length){setSyncPill();return;}
-  const recs=getRecs(); setSyncPill();
-  for(const id of [...q]){
-    const r=recs.find(x=>x.id===id); if(!r){q=q.filter(x=>x!==id);continue;}
-    try{ const ok=await postRecord(r);
-      if(ok){r.synced=true; q=q.filter(x=>x!==id);} else break;
-    }catch(e){break;}
+  const q=LS.get(KEY_QUEUE,[]); if(!q.length){setSyncPill();return;}
+  setSyncPill(); const enviados={};
+  for(const id of q){
+    const r=getRecs().find(x=>x.id===id);
+    if(!r){ enviados[id]=null; continue; }
+    try{ const ok=await postRecord(r); if(ok) enviados[id]=r.savedAt; else break; }
+    catch(e){ break; }
   }
-  saveRecs(recs); LS.set(KEY_QUEUE,q); setSyncPill(); renderRecList?.();
+  marcar(colaQuitar(KEY_QUEUE, enviados), r=>{ r.synced=true; });
+  setSyncPill(); renderRecList?.();
 }
 window.addEventListener('online',()=>{setSyncPill();flushQueue();flushQueueDsnc();flushQueueSheet();});
 window.addEventListener('offline',setSyncPill);
@@ -2066,6 +2128,7 @@ function toast(msg,bad,ok){const t=document.getElementById('toast');t.textConten
 resizeAll();
 blankForm();
 renderRecCount();
+setTimeout(()=>{ compactarFirmasGuardadas().then(n=>{ if(n) renderRecList?.(); }).catch(()=>{}); }, 1500);
 setSyncPill();
 flushQueue();
 </script>
