@@ -602,6 +602,9 @@
           precio en el formato; otros productos no suman huella.</p>
       </details>
     </div>
+    <div class="setrow" style="text-align:center;padding-top:6px;padding-bottom:6px">
+      <span style="font-size:12px;color:var(--muted)">Versión de la app: <b id="appVersion"></b></span>
+    </div>
     <div class="setrow">
       <h3>Identificación del equipo</h3>
       <p>Se adjunta a cada registro para saber desde qué tablet se capturó.</p>
@@ -644,6 +647,7 @@ const LS = {
   get:(k,d)=>{try{const v=localStorage.getItem(k);return v?JSON.parse(v):d}catch(e){return d}},
   set:(k,v)=>{try{localStorage.setItem(k,JSON.stringify(v))}catch(e){toast('No se pudo guardar (almacenamiento lleno)',1)}},
 };
+const APP_VERSION='2026.10.07-c';
 const KEY_RECS='uivml_records', KEY_QUEUE='uivml_queue', KEY_CFG='uivml_cfg', KEY_QUEUE_DSNC='uivml_queue_dsnc';
 let cfg = LS.get(KEY_CFG,{syncUrl:'',device:'',dsncUrl:'',dsncKey:'',dsncModo:'post',sheetScriptUrl:'',sheetUrl:'',sheetId:'',sheetToken:''});
 let editingId = null;
@@ -1261,13 +1265,17 @@ function renderRecList(){
   if(!recs.length){list.innerHTML='<div class="empty">No hay verificaciones guardadas todavía.<br>Complete el formulario y toque <b>Guardar</b>.</div>';return;}
   list.innerHTML='';
   recs.forEach(r=>{
-    let badge=r.synced?'<span class="badge synced">Sincronizado</span>'
-      :(cfg.syncUrl?'<span class="badge pend">Pendiente</span>':'<span class="badge local">Local</span>');
+    // Estado por destino (solo de los envíos que estén configurados)
+    const B=(c,t)=>`<span class="badge ${c}">${t}</span>`, bs=[];
+    if(cfg.syncUrl) bs.push(r.synced?B('synced','CENAME ✓'):B('pend','CENAME: pendiente'));
+    if(cfg.dsncUrl) bs.push(r.dsncSynced?B('synced','DSNC ✓')
+      : dsncTieneActividad(r)?B('pend','DSNC: pendiente'):B('local','DSNC: sin datos'));
     if(cfg.sheetScriptUrl&&cfg.sheetId){
       const falta=registroFaltantes(r).length;
-      badge+= r.sheetSynced&&!falta ? ' <span class="badge synced">En base anual</span>'
-        : (falta ? ' <span class="badge local">Incompleto</span>' : ' <span class="badge pend">Base: pendiente</span>');
+      bs.push(falta?B('local','Incompleto'):r.sheetSynced?B('synced','Base anual ✓'):B('pend','Base: pendiente'));
     }
+    if(!bs.length) bs.push(B('local','Guardado en el equipo'));
+    const badge=`<div style="display:flex;flex-direction:column;gap:4px;align-items:flex-end">${bs.join('')}</div>`;
     const d=document.createElement('div'); d.className='rec';
     d.innerHTML=`<div class="top"><div>
         <div class="nm">${esc(r.nombreComercial)||'(sin nombre)'}</div>
@@ -1430,9 +1438,16 @@ function trySheet(r){
   let q=LS.get(KEY_QUEUE_SHEET,[]); q.push(r.id); LS.set(KEY_QUEUE_SHEET,[...new Set(q)]);
   setSyncPill(); flushQueueSheet();
 }
+// Pendientes reales: solo de los envíos configurados y de reportes que existen
+function pendientesPorDestino(){
+  const ids=new Set(getRecs().map(r=>r.id));
+  const n=k=>LS.get(k,[]).filter(id=>ids.has(id)).length;
+  return { CENAME: cfg.syncUrl?n(KEY_QUEUE):0, DSNC: cfg.dsncUrl?n(KEY_QUEUE_DSNC):0,
+    'Base anual': (cfg.sheetScriptUrl&&cfg.sheetId)?n(KEY_QUEUE_SHEET):0 };
+}
 function setSyncPill(){
   const p=document.getElementById('syncPill'), t=document.getElementById('syncTxt');
-  const q=LS.get(KEY_QUEUE,[]).length + LS.get(KEY_QUEUE_DSNC,[]).length + LS.get(KEY_QUEUE_SHEET,[]).length;
+  const q=Object.values(pendientesPorDestino()).reduce((a,b)=>a+b,0);
   p.className='pill';
   if(!cfg.syncUrl && !cfg.dsncUrl && !cfg.sheetScriptUrl){t.textContent='Local';return;}
   if(!navigator.onLine){p.classList.add('off');t.textContent='Sin conexión'+(q?` · ${q}`:'');return;}
@@ -1564,8 +1579,10 @@ function dsncRespuestaOk(texto){
   const sinActividad = (j.errorDetails||[]).some(d=>/actividad cuantificable/i.test(d&&d.message||''));
   if(sinActividad) return {ok:false, vacio:true, detalle:'la API exige actividad cuantificable (registro sin verificaciones)', j};
   if(err>0) return {ok:false, detalle:`${err} registro(s) con error de ${rec} recibido(s)`, j};
-  if(rec>0 && ins===0 && dup===0) return {ok:false, detalle:'no se insertó ningún registro', j};
-  return {ok:true, detalle:`insertados: ${ins}, duplicados: ${dup}`, j};
+  // Sin errores = aceptado. Si el idReporte ya existía, la DSNC lo ACTUALIZA y responde
+  // inserted:0 (el campo de actualizados puede variar de nombre según su versión).
+  const act=Number(j.updated??j.actualizados??j.updates??j.upserted??j.modified??0);
+  return {ok:true, detalle:`insertados: ${ins}, actualizados: ${act}, duplicados: ${dup}`, j};
 }
 // Identificador oficial del reporte: ML-VC-<correlativo> (evita prefijo duplicado
 // si el inspector ya lo escribió completo en el campo).
@@ -1971,13 +1988,44 @@ document.getElementById('exportJson').addEventListener('click',()=>{
   saveTextFile(name, JSON.stringify(getRecs(),null,2), 'application/json');
 });
 document.getElementById('importJson').addEventListener('click',()=>document.getElementById('importFile').click());
+/* Importación: combina por reporte y conserva la versión MÁS RECIENTE.
+   Un reporte se reconoce por su id o, si se capturó por separado en otro
+   equipo, por su No. ML-VC. Antes solo se agregaban los que no existían, así
+   que las versiones completas de otro equipo nunca reemplazaban a las viejas. */
+function importarRegistros(arr){
+  const recs=getRecs(), clave=r=>mlvcCorto(r).toLowerCase();
+  let nuevos=0, actualizados=0, iguales=0; const cambiados=[];
+  arr.forEach(imp=>{
+    if(!imp || !imp.id) return;
+    let i=recs.findIndex(x=>x.id===imp.id);
+    if(i<0 && clave(imp)) i=recs.findIndex(x=>clave(x)===clave(imp));
+    if(i<0){ recs.push(imp); nuevos++; cambiados.push(imp); return; }
+    const loc=recs[i];
+    if(String(imp.savedAt||'') > String(loc.savedAt||'')){
+      recs[i]=imp; actualizados++; cambiados.push(imp);
+      if(editingId===loc.id){ editingId=imp.id; apply(imp); }   // el formulario abierto toma la versión nueva
+    } else iguales++;
+  });
+  saveRecs(recs);
+  // Lo que el otro equipo no alcanzó a enviar se envía desde aquí (sin duplicar:
+  // la DSNC y la base anual actualizan por No. ML-VC)
+  cambiados.forEach(r=>{
+    if(cfg.dsncUrl && !r.dsncSynced && dsncTieneActividad(r)){
+      const q=LS.get(KEY_QUEUE_DSNC,[]); q.push(r.id); LS.set(KEY_QUEUE_DSNC,[...new Set(q)]); }
+    if(cfg.sheetScriptUrl && cfg.sheetId && !r.sheetSynced && !registroFaltantes(r).length){
+      const q=LS.get(KEY_QUEUE_SHEET,[]); q.push(r.id); LS.set(KEY_QUEUE_SHEET,[...new Set(q)]); }
+  });
+  return {nuevos, actualizados, iguales};
+}
 document.getElementById('importFile').addEventListener('change',e=>{
   const f=e.target.files[0]; if(!f)return; const rd=new FileReader();
   rd.onload=()=>{try{const arr=JSON.parse(rd.result);if(!Array.isArray(arr))throw 0;
-    const recs=getRecs(); const ids=new Set(recs.map(x=>x.id));
-    arr.forEach(r=>{if(!ids.has(r.id))recs.push(r);}); saveRecs(recs);
-    renderRecCount();toast(`Importados ${arr.length} registro(s)`,0,1);
-  }catch(err){toast('Archivo inválido',1);}};
+    const k=importarRegistros(arr);
+    renderRecCount(); renderRecList?.(); setSyncPill();
+    toast(`Importación: ${k.nuevos} nuevos, ${k.actualizados} actualizados, ${k.iguales} sin cambios`,0,1);
+    flushQueueDsnc(); flushQueueSheet();
+  }catch(err){toast('Archivo inválido',1);}
+  e.target.value='';};                    // permite volver a importar el mismo archivo
   rd.readAsText(f);
 });
 
@@ -2125,6 +2173,12 @@ function toast(msg,bad,ok){const t=document.getElementById('toast');t.textConten
   t.className='toast show'+(bad?' bad':ok?' ok':'');clearTimeout(toastTimer);
   toastTimer=setTimeout(()=>t.className='toast',2200);}
 
+document.getElementById('appVersion').textContent=APP_VERSION;
+document.getElementById('syncPill').addEventListener('click',()=>{
+  const d=Object.entries(pendientesPorDestino()).filter(([,v])=>v);
+  toast(d.length?'Pendientes · '+d.map(([k,v])=>`${k}: ${v}`).join(' · '):'Sin envíos pendientes');
+  if(d.length && navigator.onLine){ flushQueue(); flushQueueDsnc(); flushQueueSheet(); }
+});
 resizeAll();
 blankForm();
 renderRecCount();
