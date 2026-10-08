@@ -512,30 +512,6 @@
     <button class="iconbtn" data-close="setOverlay">✕</button></header>
   <div class="scroll">
     <div class="setrow">
-      <h3>Sincronización en tiempo real</h3>
-      <p>Pegue la URL del servidor que recibe los datos (endpoint <code>POST</code> JSON).
-        Al guardar, cada verificación se envía automáticamente; si no hay señal, queda en cola
-        y se reintenta al recuperar conexión.</p>
-      <label class="f" style="color:var(--muted)">URL del endpoint
-        <input id="syncUrl" placeholder="https://script.google.com/macros/s/…/exec" style="margin-top:5px"></label>
-      <div class="btnline" style="margin-top:10px">
-        <button id="saveUrl">Guardar URL</button>
-        <button class="sec" id="testUrl">Probar envío</button>
-        <button class="sec" id="flushNow">Sincronizar pendientes</button>
-      </div>
-      <details class="help" style="margin-top:10px">
-        <summary>¿Cómo crear el servidor gratis con Google Sheets?</summary>
-        <ol>
-          <li>Cree una hoja en Google Sheets.</li>
-          <li>Menú <code>Extensiones → Apps Script</code>.</li>
-          <li>Pegue una función <code>doPost(e)</code> que haga <code>appendRow</code> con <code>JSON.parse(e.postData.contents)</code>.</li>
-          <li><code>Implementar → Nueva implementación → Aplicación web</code>, acceso “Cualquiera”.</li>
-          <li>Copie la URL <code>/exec</code> y péguela arriba.</li>
-        </ol>
-        <p>Así los datos llegan a la hoja al instante y se actualizan en tiempo real para toda la unidad.</p>
-      </details>
-    </div>
-    <div class="setrow">
       <h3>Base anual de verificaciones (Google Sheets)</h3>
       <p>Cuando un reporte está <b>completo</b>, se escribe automáticamente en la base anual
         (hojas <code>datos_admin</code> y <code>datos_metrologicos</code>). Si el No. ML-VC ya existe,
@@ -560,6 +536,30 @@
           en cada ensayo: producto, C, S, P1, P2 cuando P1 &lt; −3, vuelta a cero y calculadora.
           Además el nombre y firma del encargado y la firma del personal de la UIVML.
           Si falta algo, el reporte se guarda en la app pero no se envía a la base.</p>
+      </details>
+    </div>
+    <div class="setrow">
+      <h3>Respaldo en la nube (Google Drive)</h3>
+      <p>Guarda cada reporte íntegro —campos, ensayos, croquis y firmas— como un documento en la carpeta
+        <b>“UVC Respaldo de reportes”</b> del Drive de la cuenta del script, y mantiene al día los demás
+        equipos. Usa la URL y el token del Apps Script configurados en <b>Base anual</b>.</p>
+      <label style="display:flex;align-items:center;gap:10px;font-size:14px;font-weight:700;color:var(--ink);cursor:pointer">
+        <input type="checkbox" id="respaldoOn" style="width:22px;height:22px;min-height:0;flex:none;margin:0">
+        Respaldar cada reporte en Google Drive</label>
+      <div class="btnline" style="margin-top:10px">
+        <button id="saveRespaldo">Guardar</button>
+        <button class="sec" id="bajarNube">Sincronizar con la nube</button>
+        <button class="sec" id="flushNow">Enviar pendientes</button>
+      </div>
+      <pre id="nubeOut" style="display:none;margin-top:10px;background:#0F172A;color:#E2E8F0;border-radius:10px;
+        padding:11px 12px;font-size:11.5px;line-height:1.5;white-space:pre-wrap;word-break:break-word"></pre>
+      <details class="help" style="margin-top:10px">
+        <summary>¿Cómo funciona?</summary>
+        <p>Al guardar un reporte se sube su versión completa (sin conexión queda en cola). Al abrir la app y al
+          pulsar <b>Sincronizar con la nube</b>: se suben los reportes que la nube no tiene, se descargan los que
+          otro equipo actualizó, y se quitan los que se eliminaron en otro equipo. Los cambios hechos en este
+          equipo que aún no se han subido nunca se reemplazan. Un reporte eliminado va a la papelera de Drive,
+          donde puede recuperarse durante 30 días. La exportación JSON sigue disponible como respaldo independiente.</p>
       </details>
     </div>
     <div class="setrow">
@@ -648,9 +648,12 @@ const LS = {
   get:(k,d)=>{try{const v=localStorage.getItem(k);return v?JSON.parse(v):d}catch(e){return d}},
   set:(k,v)=>{try{localStorage.setItem(k,JSON.stringify(v))}catch(e){toast('No se pudo guardar (almacenamiento lleno)',1)}},
 };
-const APP_VERSION='2026.10.07-e';
+const APP_VERSION='2026.10.08-a';
 const KEY_RECS='uivml_records', KEY_QUEUE='uivml_queue', KEY_CFG='uivml_cfg', KEY_QUEUE_DSNC='uivml_queue_dsnc';
-let cfg = LS.get(KEY_CFG,{syncUrl:'',device:'',dsncUrl:'',dsncKey:'',dsncModo:'post',sheetScriptUrl:'',sheetUrl:'',sheetId:'',sheetToken:''});
+let cfg = LS.get(KEY_CFG,{device:'',dsncUrl:'',dsncKey:'',dsncModo:'post',sheetScriptUrl:'',sheetUrl:'',sheetId:'',sheetToken:'',respaldo:false});
+const KEY_QUEUE_BORRAR='uivml_queue_borrar';
+// El respaldo en la nube usa el mismo Apps Script (URL y token) que la base anual
+function respaldoActivo(){ return !!(cfg.respaldo && cfg.sheetScriptUrl); }
 let editingId = null;
 
 /* ====================================================================== */
@@ -1271,7 +1274,7 @@ function renderRecList(){
   recs.forEach(r=>{
     // Estado por destino (solo de los envíos que estén configurados)
     const B=(c,t)=>`<span class="badge ${c}">${t}</span>`, bs=[];
-    if(cfg.syncUrl) bs.push(r.synced?B('synced','CENAME ✓'):B('pend','CENAME: pendiente'));
+    if(respaldoActivo()) bs.push(r.synced?B('synced','Nube ✓'):B('pend','Nube: pendiente'));
     if(cfg.dsncUrl) bs.push(r.dsncSynced?B('synced','DSNC ✓')
       : (dsncTieneActividad(r)&&_filas(r).length)?B('pend','DSNC: pendiente'):B('local','DSNC: sin datos'));
     if(cfg.sheetScriptUrl&&cfg.sheetId){
@@ -1294,7 +1297,14 @@ function renderRecList(){
     d.querySelector('[data-act=open]').addEventListener('click',()=>{apply(r);closeOverlay('recOverlay');toast('Registro cargado');});
     d.querySelector('[data-act=pdf]').addEventListener('click',()=>{buildPrint(r);setTimeout(doPrint,60);});
     d.querySelector('[data-act=del]').addEventListener('click',async ()=>{
-      if(await uiConfirm('¿Eliminar esta verificación?','Eliminar')){saveRecs(getRecs().filter(x=>x.id!==r.id));renderRecList();renderRecCount();}
+      const msg=respaldoActivo()?'¿Eliminar esta verificación? También se moverá a la papelera de Google Drive (recuperable 30 días).'
+        :'¿Eliminar esta verificación?';
+      if(await uiConfirm(msg,'Eliminar')){
+        saveRecs(getRecs().filter(x=>x.id!==r.id));
+        LS.set(KEY_QUEUE, LS.get(KEY_QUEUE,[]).filter(id=>id!==r.id));
+        if(respaldoActivo()){ LS.set(KEY_QUEUE_BORRAR,[...new Set([...LS.get(KEY_QUEUE_BORRAR,[]),r.id])]); flushQueue(); }
+        renderRecList();renderRecCount();setSyncPill();
+      }
     });
     list.appendChild(d);
   });
@@ -1427,7 +1437,7 @@ async function _flushSheet(){
     }catch(e){ break; }                  // sin conexión: se reintenta después
   }
   const hechos=colaQuitar(KEY_QUEUE_SHEET, enviados);
-  marcar(hechos, r=>{ r.sheetSynced=true; r.sheetSyncedAt=new Date().toISOString(); r.sheetAccion=accion[r.id]; });
+  marcar(hechos, r=>{ r.sheetSynced=true; r.sheetSyncedAt=new Date().toISOString(); r.sheetAccion=accion[r.id]; }, true);
   if(hechos.size) toast('Base anual actualizada ✓',0,1);
   setSyncPill(); renderRecList?.();
 }
@@ -1446,23 +1456,19 @@ function trySheet(r){
 function pendientesPorDestino(){
   const ids=new Set(getRecs().map(r=>r.id));
   const n=k=>LS.get(k,[]).filter(id=>ids.has(id)).length;
-  return { CENAME: cfg.syncUrl?n(KEY_QUEUE):0, DSNC: cfg.dsncUrl?n(KEY_QUEUE_DSNC):0,
+  return { Nube: respaldoActivo()?n(KEY_QUEUE)+LS.get(KEY_QUEUE_BORRAR,[]).length:0, DSNC: cfg.dsncUrl?n(KEY_QUEUE_DSNC):0,
     'Base anual': (cfg.sheetScriptUrl&&cfg.sheetId)?n(KEY_QUEUE_SHEET):0 };
 }
 function setSyncPill(){
   const p=document.getElementById('syncPill'), t=document.getElementById('syncTxt');
   const q=Object.values(pendientesPorDestino()).reduce((a,b)=>a+b,0);
   p.className='pill';
-  if(!cfg.syncUrl && !cfg.dsncUrl && !cfg.sheetScriptUrl){t.textContent='Local';return;}
+  if(!respaldoActivo() && !cfg.dsncUrl && !cfg.sheetScriptUrl){t.textContent='Local';return;}
   if(!navigator.onLine){p.classList.add('off');t.textContent='Sin conexión'+(q?` · ${q}`:'');return;}
   if(q){p.classList.add('sync');t.textContent=`Pendientes: ${q}`;}
   else{p.classList.add('on');t.textContent='En línea';}
 }
-async function postRecord(r){
-  const res=await fetch(cfg.syncUrl,{method:'POST',headers:{'Content-Type':'text/plain;charset=utf-8'},
-    body:JSON.stringify(r)});
-  return res.ok;
-}
+
 
 /* ---- Metas DSNC: JSON por estación (modelo de la hoja database_uvc) ----
    huella por ensayo = P1[in³] × (precio_galón ÷ 231)      (231 in³ = 1 galón)
@@ -1638,14 +1644,14 @@ async function _flushDsnc(){
     const ok=await postDsncBatch(lote.map(dsncPayload));
     if(ok===true || ok==='vacio'){
       const env={}; lote.forEach(r=>env[r.id]=r.savedAt);
-      marcar(colaQuitar(KEY_QUEUE_DSNC, env), r=>{ r.dsncSynced=(ok===true); });
+      marcar(colaQuitar(KEY_QUEUE_DSNC, env), r=>{ r.dsncSynced=(ok===true); }, true);
     }
   }catch(e){/* sin conexión: se conserva la cola y se reintenta */}
   setSyncPill(); renderRecList?.();
 }
 async function trySync(r){
   if(r){
-    if(cfg.syncUrl){let q=LS.get(KEY_QUEUE,[]);q.push(r.id);q=[...new Set(q)];LS.set(KEY_QUEUE,q);}
+    if(respaldoActivo()){let q=LS.get(KEY_QUEUE,[]);q.push(r.id);q=[...new Set(q)];LS.set(KEY_QUEUE,q);}
     if(cfg.dsncUrl && dsncTieneActividad(r)){let q=LS.get(KEY_QUEUE_DSNC,[]);q.push(r.id);q=[...new Set(q)];LS.set(KEY_QUEUE_DSNC,q);}
   }
   setSyncPill();
@@ -1673,25 +1679,98 @@ function colaQuitar(key, enviados){            // enviados: {id: savedAt enviado
   LS.set(key, LS.get(key,[]).filter(id=>!hechos.has(id)));
   return hechos;
 }
-function marcar(ids, fn){
+function marcar(ids, fn, resubir=false){
   if(!ids.size) return;
   const recs=getRecs(); let cambio=false;
   recs.forEach(r=>{ if(ids.has(r.id)){ fn(r); cambio=true; } });
-  if(cambio) saveRecs(recs);
+  if(!cambio) return;
+  saveRecs(recs);
+  // Las marcas de DSNC/base anual viajan con el documento para que los otros
+  // equipos vean el mismo estado: se vuelve a subir a la nube.
+  if(resubir && respaldoActivo()){
+    LS.set(KEY_QUEUE,[...new Set([...LS.get(KEY_QUEUE,[]),...ids])]); flushQueue();
+  }
 }
 async function flushQueue(){ return correrSerie(flushQueue, _flushCename); }
-async function _flushCename(){
-  if(!cfg.syncUrl||!navigator.onLine) return;
+async function _flushCename(){                // subida a la nube (Drive)
+  if(!respaldoActivo()||!navigator.onLine) return;
+  const tok=cfg.sheetToken||'';
+  // 1) eliminados en este equipo → papelera de Drive
+  const qb=LS.get(KEY_QUEUE_BORRAR,[]);
+  if(qb.length){
+    try{ const j=await postSheet({action:'UVC_RESP_BORRAR', token:tok, ids:qb});
+      if(j.success) LS.set(KEY_QUEUE_BORRAR, LS.get(KEY_QUEUE_BORRAR,[]).filter(id=>!qb.includes(id)));
+    }catch(e){ setSyncPill(); return; }
+  }
+  // 2) reportes guardados → documento completo
   const q=LS.get(KEY_QUEUE,[]); if(!q.length){setSyncPill();return;}
-  setSyncPill(); const enviados={};
+  setSyncPill(); const enviados={}, carpeta={};
   for(const id of q){
     const r=getRecs().find(x=>x.id===id);
     if(!r){ enviados[id]=null; continue; }
-    try{ const ok=await postRecord(r); if(ok) enviados[id]=r.savedAt; else break; }
-    catch(e){ break; }
+    try{
+      const j=await postSheet({action:'UVC_RESP_GUARDAR', token:tok, registro:r});
+      if(j.success){ enviados[id]=r.savedAt; carpeta[id]=j.carpetaId; }
+      else { toast('Nube: '+(j.message||'error al respaldar'),1); break; }
+    }catch(e){ break; }                  // sin conexión: se reintenta después
   }
-  marcar(colaQuitar(KEY_QUEUE, enviados), r=>{ r.synced=true; });
+  marcar(colaQuitar(KEY_QUEUE, enviados), r=>{ r.synced=true; if(carpeta[r.id]) r.nubeId=carpeta[r.id]; });
   setSyncPill(); renderRecList?.();
+}
+/* Sincronización completa con la nube:
+   1) sube lo pendiente; 2) quita aquí los reportes que se eliminaron en otro equipo
+   (estaban en ESTA nube y ya no están); 3) sube lo que la nube no tiene;
+   4) descarga lo que otro equipo actualizó. Los cambios locales sin subir se conservan. */
+let nubeCorriendo=null;
+function sincronizarNube(){
+  if(!nubeCorriendo) nubeCorriendo=_sincNube().finally(()=>{ nubeCorriendo=null; });
+  return nubeCorriendo;
+}
+async function _sincNube(){
+  if(!respaldoActivo()) throw new Error('El respaldo en la nube no está activado');
+  if(!navigator.onLine) throw new Error('Sin conexión a internet');
+  const tok=cfg.sheetToken||'';
+  await flushQueue();
+  const lista=await postSheet({action:'UVC_RESP_LISTAR', token:tok});
+  if(!lista.success) throw new Error(lista.message||'No se pudo leer la nube');
+  const nube=new Map((lista.documentos||[]).map(d=>[d.id,d])), carpetaId=lista.carpetaId;
+  const pendB=new Set(LS.get(KEY_QUEUE_BORRAR,[]));
+  // 2) eliminados en otro equipo
+  let borradosFuera=0;
+  { const pS=new Set(LS.get(KEY_QUEUE,[])), fin=getRecs();
+    const quedan=fin.filter(r=>!(r.synced && r.nubeId && r.nubeId===carpetaId && !nube.has(r.id) && !pS.has(r.id)));
+    borradosFuera=fin.length-quedan.length; if(borradosFuera) saveRecs(quedan); }
+  // 3) lo que solo existe en este equipo se sube
+  const subir=getRecs().filter(r=>!nube.has(r.id) && !pendB.has(r.id)).map(r=>r.id);
+  if(subir.length){ LS.set(KEY_QUEUE,[...new Set([...LS.get(KEY_QUEUE,[]),...subir])]); await flushQueue(); }
+  // 4) descarga lo que cambió en la nube
+  const locales=getRecs(), pS2=new Set(LS.get(KEY_QUEUE,[]));
+  let conservados=0;
+  const bajar=[...nube.values()].filter(d=>{
+    if(pendB.has(d.id)) return false;
+    const l=locales.find(r=>r.id===d.id);
+    if(l && pS2.has(d.id)){ conservados++; return false; }      // cambios locales sin subir
+    return !l || l.savedAt!==d.savedAt || (l.rev||0)!==(d.rev||0)
+      || !!l.dsncSynced!==!!d.dsnc || !!l.sheetSynced!==!!d.base;
+  });
+  let nuevos=0, actualizados=0;
+  for(let i=0;i<bajar.length;i+=20){
+    const j=await postSheet({action:'UVC_RESP_DESCARGAR', token:tok, archivos:bajar.slice(i,i+20).map(d=>d.archivo)});
+    if(!j.success) throw new Error(j.message||'No se pudo descargar de la nube');
+    const fin=getRecs(), pS=new Set(LS.get(KEY_QUEUE,[])), pB=new Set(LS.get(KEY_QUEUE_BORRAR,[]));
+    (j.registros||[]).forEach(reg=>{
+      if(!reg||!reg.id||pS.has(reg.id)||pB.has(reg.id)) return;   // pudo editarse mientras se descargaba
+      const k=fin.findIndex(r=>r.id===reg.id), loc=k>=0?fin[k]:null;
+      const x=Object.assign({}, reg, {synced:true, nubeId:carpetaId});
+      if(loc && loc.savedAt===reg.savedAt && (loc.rev||0)===(reg.rev||0)){   // misma versión: combina marcas
+        x.dsncSynced=!!(loc.dsncSynced||reg.dsncSynced); x.sheetSynced=!!(loc.sheetSynced||reg.sheetSynced);
+      }
+      if(k<0){ fin.push(x); nuevos++; } else { fin[k]=x; actualizados++; if(editingId===reg.id) apply(x); }
+    });
+    saveRecs(fin);
+  }
+  renderRecList?.(); renderRecCount(); setSyncPill();
+  return {enNube:nube.size+subir.length, nuevos, actualizados, subidos:subir.length, borradosFuera, conservados};
 }
 window.addEventListener('online',()=>{setSyncPill();flushQueue();flushQueueDsnc();flushQueueSheet();});
 window.addEventListener('offline',setSyncPill);
@@ -1699,7 +1778,6 @@ window.addEventListener('offline',setSyncPill);
 /* ====================================================================== */
 /* Settings actions                                                       */
 /* ====================================================================== */
-document.getElementById('syncUrl').value=cfg.syncUrl||'';
 document.getElementById('dsncUrl').value=cfg.dsncUrl||'';
 document.getElementById('dsncKey').value=cfg.dsncKey||'';
 /* ---- Base anual (Google Sheets) ---- */
@@ -1968,24 +2046,37 @@ document.getElementById('exportDsnc').addEventListener('click',()=>{
   saveTextFile(name, JSON.stringify(sobre,null,2), 'application/json');
   toast('Metas DSNC exportadas ✓ (sin la API Key)',0,1);
 });
-document.getElementById('saveUrl').addEventListener('click',()=>{
-  cfg.syncUrl=limpiaUrl(document.getElementById('syncUrl').value);
-  document.getElementById('syncUrl').value=cfg.syncUrl; LS.set(KEY_CFG,cfg);
-  toast('URL guardada',0,1); setSyncPill();
-});
 document.getElementById('saveDevice').addEventListener('click',()=>{
   cfg.device=document.getElementById('deviceName').value.trim(); LS.set(KEY_CFG,cfg); toast('Equipo guardado',0,1);
 });
-document.getElementById('testUrl').addEventListener('click',async()=>{
-  const url=document.getElementById('syncUrl').value.trim();
-  if(!url){toast('Ingrese una URL primero',1);return;}
-  cfg.syncUrl=url;LS.set(KEY_CFG,cfg);
-  toast('Enviando prueba…');
-  try{const ok=await postRecord({id:'TEST-'+Date.now(),test:true,savedAt:new Date().toISOString(),device:cfg.device});
-    toast(ok?'Prueba enviada ✓':'El servidor respondió error',ok?0:1,ok?1:0);}
-  catch(e){toast('No se pudo conectar al servidor',1);}
-  setSyncPill();
+/* ---- Respaldo en la nube ---- */
+document.getElementById('respaldoOn').checked=!!cfg.respaldo;
+async function correrSincNube(){
+  const out=document.getElementById('nubeOut');
+  if(!cfg.sheetScriptUrl){ toast('Primero configure la URL y el token del Apps Script en "Base anual"',1); return; }
+  if(!respaldoActivo()){ toast('Active el respaldo en la nube y pulse Guardar',1); return; }
+  out.style.display='block'; out.textContent='Sincronizando con la nube…';
+  try{
+    const k=await sincronizarNube();
+    const L=['✓ SINCRONIZADO CON LA NUBE','Documentos en la nube: '+k.enNube];
+    if(k.subidos) L.push('Subidos desde este equipo: '+k.subidos);
+    if(k.nuevos) L.push('Descargados (nuevos en este equipo): '+k.nuevos);
+    if(k.actualizados) L.push('Actualizados desde la nube: '+k.actualizados);
+    if(k.borradosFuera) L.push('Quitados aquí porque se eliminaron en otro equipo: '+k.borradosFuera);
+    if(k.conservados) L.push('Conservados con cambios locales aún sin subir: '+k.conservados);
+    if(!k.subidos&&!k.nuevos&&!k.actualizados&&!k.borradosFuera) L.push('Este equipo ya estaba al día.');
+    out.textContent=L.join('\n');
+  }catch(e){
+    out.textContent='✗ '+(e.name==='AbortError'?'Tiempo de espera agotado':e.message)
+      +'\nSi el mensaje es "Acción no reconocida", falta actualizar el Apps Script a la versión con respaldo.';
+  }
+}
+document.getElementById('saveRespaldo').addEventListener('click',()=>{
+  cfg.respaldo=document.getElementById('respaldoOn').checked; LS.set(KEY_CFG,cfg);
+  setSyncPill(); renderRecList?.();
+  if(cfg.respaldo) correrSincNube(); else toast('Respaldo en la nube desactivado');
 });
+document.getElementById('bajarNube').addEventListener('click',correrSincNube);
 document.getElementById('flushNow').addEventListener('click',()=>{flushQueue();flushQueueDsnc();flushQueueSheet();toast('Sincronizando…');});
 document.getElementById('exportJson').addEventListener('click',()=>{
   const name='verificaciones_uivml_'+new Date().toISOString().slice(0,10)+'.json';
@@ -2018,6 +2109,7 @@ async function importarRegistros(arr){
   // Lo que el otro equipo no alcanzó a enviar se envía desde aquí (sin duplicar:
   // la DSNC y la base anual actualizan por No. ML-VC)
   cambiados.forEach(r=>{
+    if(respaldoActivo()){ const q=LS.get(KEY_QUEUE,[]); q.push(r.id); LS.set(KEY_QUEUE,[...new Set(q)]); }
     if(cfg.dsncUrl && !r.dsncSynced && dsncTieneActividad(r)){
       const q=LS.get(KEY_QUEUE_DSNC,[]); q.push(r.id); LS.set(KEY_QUEUE_DSNC,[...new Set(q)]); }
     if(cfg.sheetScriptUrl && cfg.sheetId && !r.sheetSynced && !registroFaltantes(r).length){
@@ -2031,7 +2123,7 @@ document.getElementById('importFile').addEventListener('change',e=>{
     const k=await importarRegistros(arr);
     renderRecCount(); renderRecList?.(); setSyncPill();
     toast(`Importación: ${k.nuevos} nuevos, ${k.actualizados} actualizados, ${k.iguales} sin cambios`,0,1);
-    flushQueueDsnc(); flushQueueSheet();
+    flushQueue(); flushQueueDsnc(); flushQueueSheet();
   }catch(err){toast('Archivo inválido',1);}
   e.target.value='';};                    // permite volver a importar el mismo archivo
   rd.readAsText(f);
@@ -2211,6 +2303,9 @@ renderRecCount();
 setTimeout(()=>{ compactarFirmasGuardadas().then(n=>{ if(n) renderRecList?.(); }).catch(()=>{}); }, 1500);
 setSyncPill();
 flushQueue();
+setTimeout(()=>{ if(respaldoActivo() && navigator.onLine) sincronizarNube().then(k=>{
+  if(k && (k.nuevos||k.actualizados||k.borradosFuera)) toast('Actualizado desde la nube ✓',0,1);
+}).catch(()=>{}); }, 2500);
 </script>
 </body>
 </html>
