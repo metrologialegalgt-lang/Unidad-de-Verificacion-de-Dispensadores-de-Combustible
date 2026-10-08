@@ -288,6 +288,7 @@
   <button class="iconbtn" id="btnSettings" title="Ajustes">⚙</button>
 </div>
 
+<div id="relojAviso" style="display:none;background:#B91C1C;color:#fff;padding:11px 16px;font-size:13.5px;line-height:1.45;font-weight:600"></div>
 <div class="wrap">
 
   <!-- ENCABEZADO -->
@@ -647,7 +648,7 @@ const LS = {
   get:(k,d)=>{try{const v=localStorage.getItem(k);return v?JSON.parse(v):d}catch(e){return d}},
   set:(k,v)=>{try{localStorage.setItem(k,JSON.stringify(v))}catch(e){toast('No se pudo guardar (almacenamiento lleno)',1)}},
 };
-const APP_VERSION='2026.10.07-c';
+const APP_VERSION='2026.10.07-e';
 const KEY_RECS='uivml_records', KEY_QUEUE='uivml_queue', KEY_CFG='uivml_cfg', KEY_QUEUE_DSNC='uivml_queue_dsnc';
 let cfg = LS.get(KEY_CFG,{syncUrl:'',device:'',dsncUrl:'',dsncKey:'',dsncModo:'post',sheetScriptUrl:'',sheetUrl:'',sheetId:'',sheetToken:''});
 let editingId = null;
@@ -1187,8 +1188,11 @@ document.querySelectorAll('.sig[data-sig]').forEach(box=>{
 /* Collect / Apply record                                                 */
 /* ====================================================================== */
 function collect(){
+  // rev: número de ediciones del reporte. Sube con cada guardado y viaja con el
+  // reporte entre equipos; no depende del reloj del dispositivo.
+  const prev=editingId?getRecs().find(x=>x.id===editingId):null;
   const r={id:editingId||('REC-'+Date.now()+'-'+Math.random().toString(36).slice(2,6)),
-    savedAt:new Date().toISOString(), device:cfg.device||'', synced:false};
+    savedAt:new Date().toISOString(), rev:((prev&&prev.rev)||0)+1, device:cfg.device||'', synced:false};
   FIELDS.forEach(f=>r[f]=document.getElementById(f).value);
   SEGS.forEach(s=>r[s]=segState[s]||'');
   r.rows=readRows();
@@ -1269,7 +1273,7 @@ function renderRecList(){
     const B=(c,t)=>`<span class="badge ${c}">${t}</span>`, bs=[];
     if(cfg.syncUrl) bs.push(r.synced?B('synced','CENAME ✓'):B('pend','CENAME: pendiente'));
     if(cfg.dsncUrl) bs.push(r.dsncSynced?B('synced','DSNC ✓')
-      : dsncTieneActividad(r)?B('pend','DSNC: pendiente'):B('local','DSNC: sin datos'));
+      : (dsncTieneActividad(r)&&_filas(r).length)?B('pend','DSNC: pendiente'):B('local','DSNC: sin datos'));
     if(cfg.sheetScriptUrl&&cfg.sheetId){
       const falta=registroFaltantes(r).length;
       bs.push(falta?B('local','Incompleto'):r.sheetSynced?B('synced','Base anual ✓'):B('pend','Base: pendiente'));
@@ -1992,21 +1996,25 @@ document.getElementById('importJson').addEventListener('click',()=>document.getE
    Un reporte se reconoce por su id o, si se capturó por separado en otro
    equipo, por su No. ML-VC. Antes solo se agregaban los que no existían, así
    que las versiones completas de otro equipo nunca reemplazaban a las viejas. */
-function importarRegistros(arr){
-  const recs=getRecs(), clave=r=>mlvcCorto(r).toLowerCase();
+/* Importación: el archivo que se importa es la fuente correcta. Cada reporte del
+   archivo REEMPLAZA al que ya existe en el equipo (se reconoce por su id o, si se
+   capturó por separado, por su No. ML-VC). Los reportes que solo existen en el
+   equipo se conservan y los nuevos se agregan. */
+async function importarRegistros(arr){
+  const fin=getRecs(), clave=r=>mlvcCorto(r).toLowerCase();
   let nuevos=0, actualizados=0, iguales=0; const cambiados=[];
   arr.forEach(imp=>{
     if(!imp || !imp.id) return;
-    let i=recs.findIndex(x=>x.id===imp.id);
-    if(i<0 && clave(imp)) i=recs.findIndex(x=>clave(x)===clave(imp));
-    if(i<0){ recs.push(imp); nuevos++; cambiados.push(imp); return; }
-    const loc=recs[i];
-    if(String(imp.savedAt||'') > String(loc.savedAt||'')){
-      recs[i]=imp; actualizados++; cambiados.push(imp);
-      if(editingId===loc.id){ editingId=imp.id; apply(imp); }   // el formulario abierto toma la versión nueva
-    } else iguales++;
+    let i=fin.findIndex(x=>x.id===imp.id);
+    if(i<0 && clave(imp)) i=fin.findIndex(x=>clave(x)===clave(imp));
+    if(i<0){ fin.push(imp); nuevos++; cambiados.push(imp); return; }
+    const loc=fin[i];
+    if(JSON.stringify(imp)===JSON.stringify(loc)){ iguales++; return; }
+    fin[i]=Object.assign({}, imp, {rev:Math.max(imp.rev||0, loc.rev||0)});
+    actualizados++; cambiados.push(fin[i]);
+    if(editingId===loc.id){ editingId=imp.id; apply(fin[i]); }   // el formulario abierto toma la versión importada
   });
-  saveRecs(recs);
+  saveRecs(fin);
   // Lo que el otro equipo no alcanzó a enviar se envía desde aquí (sin duplicar:
   // la DSNC y la base anual actualizan por No. ML-VC)
   cambiados.forEach(r=>{
@@ -2019,8 +2027,8 @@ function importarRegistros(arr){
 }
 document.getElementById('importFile').addEventListener('change',e=>{
   const f=e.target.files[0]; if(!f)return; const rd=new FileReader();
-  rd.onload=()=>{try{const arr=JSON.parse(rd.result);if(!Array.isArray(arr))throw 0;
-    const k=importarRegistros(arr);
+  rd.onload=async()=>{try{const arr=JSON.parse(rd.result);if(!Array.isArray(arr))throw 0;
+    const k=await importarRegistros(arr);
     renderRecCount(); renderRecList?.(); setSyncPill();
     toast(`Importación: ${k.nuevos} nuevos, ${k.actualizados} actualizados, ${k.iguales} sin cambios`,0,1);
     flushQueueDsnc(); flushQueueSheet();
@@ -2174,6 +2182,24 @@ function toast(msg,bad,ok){const t=document.getElementById('toast');t.textConten
   toastTimer=setTimeout(()=>t.className='toast',2200);}
 
 document.getElementById('appVersion').textContent=APP_VERSION;
+/* La fecha del equipo define la fecha de los reportes nuevos y el orden de las
+   versiones. Si difiere por horas de la del servidor, se avisa para corregirla. */
+async function verificarReloj(){
+  if(!/^https?:/.test(location.protocol) || !navigator.onLine) return;
+  try{
+    const res=await fetch(location.href.split('#')[0],{method:'HEAD',cache:'no-store'});
+    const d=res.headers.get('Date'); if(!d) return;
+    const real=new Date(d), dif=Date.now()-real.getTime();
+    if(Math.abs(dif) < 6*3600*1000) return;
+    const f=x=>x.toLocaleDateString('es-GT',{day:'2-digit',month:'2-digit',year:'numeric'});
+    const av=document.getElementById('relojAviso');
+    av.innerHTML=`⚠ La fecha de este equipo (<b>${f(new Date())}</b>) no coincide con la fecha real (<b>${f(real)}</b>). `+
+      `Corríjala en la configuración del equipo (fecha y hora automáticas): los reportes nuevos tomarían una fecha equivocada `+
+      `y las versiones entre equipos se ordenarían mal.`;
+    av.style.display='block';
+  }catch(e){}
+}
+setTimeout(verificarReloj, 800);
 document.getElementById('syncPill').addEventListener('click',()=>{
   const d=Object.entries(pendientesPorDestino()).filter(([,v])=>v);
   toast(d.length?'Pendientes · '+d.map(([k,v])=>`${k}: ${v}`).join(' · '):'Sin envíos pendientes');
