@@ -515,7 +515,9 @@
       <h3>Base anual de verificaciones (Google Sheets)</h3>
       <p>Cuando un reporte está <b>completo</b>, se escribe automáticamente en la base anual
         (hojas <code>datos_admin</code> y <code>datos_metrologicos</code>). Si el No. ML-VC ya existe,
-        se <b>actualiza</b> en lugar de duplicarse. Al cambiar de año solo cambie el enlace de la hoja.</p>
+        se <b>actualiza</b> en lugar de duplicarse. Al cambiar de año solo cambie el enlace de la hoja.
+        Además se deja en la hoja <code>sgc_cola</code> la fila que Power Automate usa para llenar el
+        Informe de verificaciones y las Verificaciones programadas.</p>
       <label class="f" style="color:var(--muted)">URL del Apps Script (termina en /exec)
         <input id="sheetScriptUrl" placeholder="https://script.google.com/macros/s/…/exec" style="margin-top:5px"></label>
       <label class="f" style="color:var(--muted);margin-top:8px">Enlace de la base del año en curso
@@ -648,7 +650,7 @@ const LS = {
   get:(k,d)=>{try{const v=localStorage.getItem(k);return v?JSON.parse(v):d}catch(e){return d}},
   set:(k,v)=>{try{localStorage.setItem(k,JSON.stringify(v))}catch(e){toast('No se pudo guardar (almacenamiento lleno)',1)}},
 };
-const APP_VERSION='2026.10.08-a';
+const APP_VERSION='2026.10.09-b';
 const KEY_RECS='uivml_records', KEY_QUEUE='uivml_queue', KEY_CFG='uivml_cfg', KEY_QUEUE_DSNC='uivml_queue_dsnc';
 let cfg = LS.get(KEY_CFG,{device:'',dsncUrl:'',dsncKey:'',dsncModo:'post',sheetScriptUrl:'',sheetUrl:'',sheetId:'',sheetToken:'',respaldo:false});
 const KEY_QUEUE_BORRAR='uivml_queue_borrar';
@@ -1392,6 +1394,32 @@ function ajustePor(r, h){
   }
   return fuera&&viejo?'AJUSTE POR AMBOS 1 Y 2':fuera?'1.ENSAYOS FUERA DE RANGO':viejo?'2.NO AJUSTE DURANTE 3 MESES':'';
 }
+/* ---- Fila para la hoja sgc_cola: Power Automate la usa para llenar los
+   Excel de la Coordinación de la Calidad (Informe y Verificaciones programadas) ---- */
+function sgcClave(r){
+  const n=mlvcCorto(r); if(!n) return '';
+  const m=n.match(/^(\d+)\s*-\s*(\d{2,4})$/);
+  if(m) return 'ML-VC-'+m[1].padStart(3,'0')+'-'+m[2].slice(-2);
+  const m2=n.match(/^(\d+)$/);
+  if(m2 && r.fecha) return 'ML-VC-'+m2[1].padStart(3,'0')+'-'+String(r.fecha).slice(2,4);
+  return 'ML-VC-'+n;
+}
+// Número de serie de Excel (días desde 1899-12-30): la celda queda como fecha real
+function excelSerial(iso){
+  if(!/^\d{4}-\d{2}-\d{2}$/.test(String(iso||''))) return '';
+  return Math.round((Date.UTC(+iso.slice(0,4),+iso.slice(5,7)-1,+iso.slice(8,10))-Date.UTC(1899,11,30))/86400000);
+}
+function sgcFila(r, h){
+  const tot=_num(r.totalSurtidores), nombre=String(r.nombreComercial||'').trim().toUpperCase();
+  return {noML:sgcClave(r), rev:r.rev||1, fechaSerial:excelSerial(r.fecha||''),
+    departamento:normLugar(r.departamento), municipio:normLugar(r.municipio), empresa:nombre,
+    objeto:'Dispensador de combustible', estaciones:1, verificaciones:h.ensayos.length,
+    inmovilizaciones:dsncPayload(r).inmovilizaciones, ajuste:r.enviarReporte==='Sí'?1:0,
+    poblacion:(h.cliDia||0)*DSNC_DIAS_MES, huella:Math.round(h.total*100)/100,
+    titular:nombre, ubicacion:String(r.direccion||'').trim(), cantidad:tot!=null?tot:'',
+    tipo:'Vigilancia', personal:String(r.nombreUIVML||'').trim(),
+    observaciones:String(r.observaciones||'').trim()||'-'};
+}
 function sheetPayload(r){
   const h=huellaDetalle(r), cli=h.cliDia, t=String(r.tel||'').replace(/\D/g,'');
   const n=k=>{const x=_num(r[k]);return x!=null?x:'';};
@@ -1411,7 +1439,7 @@ function sheetPayload(r){
       pulgS:h.pul.Superior??'', pulgR:h.pul.Regular??'', pulgD:h.pul.Diesel??'',
       despachos:h.desp, huellaNeg:h.neg, huellaPos:h.pos, huellaTotal:h.total
     },
-    ensayos:h.ensayos};
+    ensayos:h.ensayos, sgc:sgcFila(r,h)};
 }
 async function postSheet(body){
   const res=await fetchTO(cfg.sheetScriptUrl,{method:'POST',headers:{'Content-Type':'text/plain;charset=utf-8'},
